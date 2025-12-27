@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Waterdropping log</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
+        #controls { padding: 12px; background: #f4f4f4; display: flex; gap: 10px; align-items:center; justify-content: center; flex-wrap:wrap; }
+        #map { flex-grow: 1; width: 100%; }
+        button { padding: 12px 18px; font-size: 15px; cursor: pointer; border: none; border-radius: 5px; color: white; }
+        .dip { background: #3498db; }
+        .drop { background: #e74c3c; }
+        .export { background: #27ae60; }
+        #status { min-width:220px; color:#333; font-size:14px; }
+        #clearPanel { position: fixed; left: 12px; bottom: 12px; background: rgba(255,255,255,0.96); padding: 10px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); font-size:13px; z-index:10000; }
+        #clearPanel button { padding:8px 12px; font-size:13px; }
+        #clearPanel input { padding:6px; font-size:13px; margin-left:6px; }
+        @media (max-width: 480px) {
+            #clearPanel { left:8px; right:8px; bottom:8px; padding:12px; border-radius:10px; }
+            #clearPanel input { display:block; width:100%; margin:8px 0 0 0; }
+            #clearPanel div[style*="display:flex"] { flex-direction:column; gap:8px; }
+            #clearPanel button { width:100%; }
+            #controls { padding:10px; }
+            button { padding:10px 14px; font-size:14px; }
+        }
+    </style>
+</head>
+<body>
+
+<div id="controls">
+    <button class="dip" id="dipButton" onclick="logDip()"> Dip </button>
+    <label for="dipGallons" style="display:flex;align-items:center;gap:6px;margin-left:6px;">
+        <span style="font-size:14px;color:#333">Gallons</span>
+        <select id="dipGallons" style="width:110px;padding:8px;border-radius:5px;border:1px solid #ccc;">
+            <option value="400">400</option>
+            <option value="500">500</option>
+            <option value="660">660</option>
+            <option value="1000">1000</option>
+            <option value="1500">1500</option>
+            <option value="2000">2000</option>
+        </select>
+    </label>
+    <button class="drop" id="dropButton" onclick="logDrop()"> Drop </button>
+    <button class="export" onclick="downloadExcel()"> Download Excel </button>
+    <button class="export" style="background:#34495e" onclick="downloadKML()"> Download KML </button>
+    <div id="status"></div>
+</div>
+
+<div id="map"></div>
+
+<div id="clearPanel">
+    <button id="startClearBtn" onclick="showClearConfirm()" style="background:#c0392b;color:#fff;border-radius:6px;padding:8px 12px">Clear Today's Log</button>
+</div>
+
+<script>
+    // Application state
+    let dataLog = [];
+    let markers = [];
+    let hasDipped = false;
+
+    // Initialize map
+    const map = L.map('map').setView([0, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Try to center on current location
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(pos => {
+            map.setView([pos.coords.latitude, pos.coords.longitude], 15);
+        }, ()=>{});
+    }
+
+    // Persistence helpers (localStorage by date)
+    function getTodayKey() {
+        const d = new Date();
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `waterlog-${y}-${m}-${day}`;
+    }
+    function saveLocalForToday() {
+        try { localStorage.setItem(getTodayKey(), JSON.stringify(dataLog)); } catch(e){console.warn('save failed',e)}
+    }
+    function loadLocalForToday() {
+        try {
+            const raw = localStorage.getItem(getTodayKey());
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                    dataLog = parsed;
+                    hasDipped = dataLog.some(e=>e.Event==='Dip');
+                }
+            }
+        } catch(e){console.warn('load failed',e)}
+    }
+
+    function restoreMarkers() {
+        if (!dataLog || dataLog.length===0) return;
+        dataLog.forEach(entry=>{
+            if (entry.Latitude && entry.Longitude) {
+                const color = entry.Event==='Dip' ? 'blue' : 'red';
+                const m = L.circleMarker([entry.Latitude, entry.Longitude], { color: color, radius: 10 }).addTo(map)
+                    .bindPopup(`${entry.Event}${entry.Gallons ? ' - ' + entry.Gallons + ' gal' : ''}<br>${entry.Timestamp}`);
+                markers.push(m);
+            }
+        });
+    }
+
+    // Load saved log and restore markers
+    loadLocalForToday();
+    restoreMarkers();
+
+    // UI helpers
+    function setStatus(msg, timeout=3000) {
+        const s = document.getElementById('status');
+        if (!s) return;
+        s.textContent = msg;
+        if (timeout) { clearTimeout(s._st); s._st = setTimeout(()=>s.textContent='',(timeout)); }
+    }
+
+    // Logging
+    function logDip(){
+        const gallons = parseFloat(document.getElementById('dipGallons').value)||0;
+        if (gallons<=0) return setStatus('Select gallons');
+        logEvent('Dip', gallons);
+        hasDipped = true;
+    }
+    function logDrop(){
+        if (!hasDipped) return setStatus('First action must be Dip — press Dip first');
+        const gallons = parseFloat(document.getElementById('dipGallons').value)||0;
+        if (gallons<=0) return setStatus('Select gallons');
+        logEvent('Drop', gallons);
+    }
+
+    async function logEvent(type, gallons){
+        // if geolocation unavailable, still record entry without coords
+        // helper to finalize and push entry (adds SourceName if provided)
+        async function finalizeEntry(entry) {
+            dataLog.push(entry);
+            saveLocalForToday();
+            if (entry.Latitude && entry.Longitude) {
+                const color = entry.Event === 'Dip' ? 'blue' : 'red';
+                const marker = L.circleMarker([entry.Latitude, entry.Longitude], { color: color, radius: 10 }).addTo(map)
+                    .bindPopup(`${entry.Event}${entry.Gallons ? ' - ' + entry.Gallons + ' gal' : ''}${entry.SourceName ? '<br>Source: ' + entry.SourceName : ''}<br>${entry.Timestamp}`).openPopup();
+                markers.push(marker);
+            }
+            setStatus(`${entry.Event} logged`);
+        }
+
+        if (!navigator.geolocation) {
+            // no geolocation available — allow naming for Dip
+            const entry = { Event: type, Timestamp: new Date().toLocaleString(), Latitude: '', Longitude: '', Gallons: typeof gallons !== 'undefined' ? gallons : '', SourceName: '' };
+            if (type === 'Dip') {
+                const name = await showSourceNamePrompt('');
+                entry.SourceName = name || 'N/A';
+            }
+            await finalizeEntry(entry);
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(async pos => {
+            const lat = pos.coords.latitude, lon = pos.coords.longitude;
+            let sourceName = '';
+            try {
+                sourceName = await fetchSourceNameFromOverpass(lat, lon);
+            } catch (e) { console.warn('Overpass lookup failed', e); sourceName = ''; }
+
+            // if Dip and no automatic name found, ask user inline (no blocking prompt)
+            if (type === 'Dip' && !sourceName) {
+                sourceName = await showSourceNamePrompt('');
+            }
+
+            const entry = { Event: type, Timestamp: new Date().toLocaleString(), Latitude: lat, Longitude: lon, Gallons: typeof gallons !== 'undefined' ? gallons : '', SourceName: sourceName || 'N/A' };
+            await finalizeEntry(entry);
+        }, async err => {
+            // geolocation failed — fallback to no-coords flow
+            const entry = { Event: type, Timestamp: new Date().toLocaleString(), Latitude: '', Longitude: '', Gallons: typeof gallons !== 'undefined' ? gallons : '', SourceName: '' };
+            if (type === 'Dip') {
+                const name = await showSourceNamePrompt('');
+                entry.SourceName = name || 'N/A';
+            }
+            await finalizeEntry(entry);
+        }, { enableHighAccuracy: true, timeout: 10000 });
+    }
+
+    function removeAllMarkers(){ markers.forEach(m=>{try{map.removeLayer(m);}catch(e){} }); markers = []; }
+
+    // Clear with single-code confirmation (mobile-friendly)
+    function showClearConfirm(){
+        const panel = document.getElementById('clearPanel'); if(!panel) return;
+        const code = String(Math.floor(1000 + Math.random()*9000)); panel._code = code;
+        panel.innerHTML = `
+            <div>To clear today's log, type the code <strong>${code}</strong> below:</div>
+            <div style="margin-top:8px"><input id="clearCodeInput" placeholder="enter code" oninput="updateClearConfirmState()" style="padding:8px;font-size:15px"></div>
+            <div style="margin-top:8px;display:flex;gap:6px;"><button id="confirmClearBtn" disabled style="background:#c0392b;color:#fff;border-radius:6px;padding:8px 12px" onclick="performClear()">Confirm Clear</button><button onclick="cancelClearConfirm()">Cancel</button></div>
+        `;
+        setTimeout(()=>{ const inp=document.getElementById('clearCodeInput'); if(inp) inp.focus(); },50);
+    }
+    function updateClearConfirmState(){ const panel=document.getElementById('clearPanel'); if(!panel) return; const code=panel._code; const codeInput=document.getElementById('clearCodeInput'); const confirmBtn=document.getElementById('confirmClearBtn'); if(!confirmBtn||!codeInput) return; confirmBtn.disabled = codeInput.value.trim()!==String(code); }
+    function cancelClearConfirm(){ const panel=document.getElementById('clearPanel'); if(!panel) return; panel.innerHTML = '<button id="startClearBtn" onclick="showClearConfirm()" style="background:#c0392b;color:#fff;border-radius:6px;padding:8px 12px">Clear Today\'s Log</button>'; }
+    function performClear(){ try{ localStorage.removeItem(getTodayKey()); }catch(e){} dataLog=[]; hasDipped=false; removeAllMarkers(); setStatus("Today's log cleared"); cancelClearConfirm(); }
+
+    // Export UI: ask helicopter number, include in filename as -<input> and date MMDDYYYY
+    function downloadExcel(){ if (dataLog.length===0) return setStatus('No data to export yet!'); showExportPrompt(); }
+    function showExportPrompt(){ let modal=document.getElementById('exportModal'); if(!modal){ modal=document.createElement('div'); modal.id='exportModal'; modal.style.position='fixed'; modal.style.left='50%'; modal.style.top='50%'; modal.style.transform='translate(-50%,-50%)'; modal.style.zIndex=20000; modal.style.background='white'; modal.style.padding='14px'; modal.style.borderRadius='8px'; modal.style.boxShadow='0 6px 20px rgba(0,0,0,0.25)'; modal.style.minWidth='260px'; modal.style.maxWidth='90%'; modal.innerHTML=`<div style="font-weight:600;margin-bottom:8px">Export Excel</div><div style="font-size:13px;margin-bottom:8px">Enter helicopter number to include in filename:</div><input id="exportHeliInput" placeholder="Helicopter #" style="width:100%;padding:8px;font-size:14px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px"><div style="display:flex;gap:8px;justify-content:flex-end"><button id="exportCancelBtn">Cancel</button><button id="exportConfirmBtn" style="background:#27ae60;color:#fff;border-radius:6px;padding:8px 12px">Export</button></div>`; document.body.appendChild(modal); document.getElementById('exportCancelBtn').onclick = ()=>{ modal.remove(); }; document.getElementById('exportConfirmBtn').onclick = ()=>{ const heli=document.getElementById('exportHeliInput').value.trim(); performExport(heli); modal.remove(); }; setTimeout(()=>{ const i=document.getElementById('exportHeliInput'); if(i) i.focus(); },50); } }
+    function performExport(helicopterNumber){
+        try{
+            // Ensure Gallons are numeric in the exported sheet
+            const exportLog = dataLog.map(e => ({
+                Event: e.Event,
+                Timestamp: e.Timestamp,
+                Latitude: e.Latitude,
+                Longitude: e.Longitude,
+                Gallons: (typeof e.Gallons === 'number') ? e.Gallons : (e.Gallons ? parseFloat(e.Gallons) : ''),
+                SourceName: e.SourceName || ''
+            }));
+
+            // Prepare worksheet and ensure Drops don't carry a SourceName in the exported sheet
+            const exportRows = exportLog.map(e => ({ Event: e.Event, Timestamp: e.Timestamp, Latitude: e.Latitude, Longitude: e.Longitude, Gallons: e.Gallons, SourceName: (e.Event === 'Drop' ? '' : (e.SourceName || '')) }));
+            const worksheet = XLSX.utils.json_to_sheet(exportRows);
+            const workbook = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(workbook, worksheet, 'Water Log');
+
+            // Summary to append at bottom of main sheet: total gallons dropped, and gallons picked up by source
+            const totalDropped = exportRows.reduce((sum, e) => sum + (e.Event === 'Drop' ? (Number(e.Gallons) || 0) : 0), 0);
+            const pickedMap = new Map();
+            exportRows.forEach(e => {
+                if (e.Event === 'Dip') {
+                    const src = e.SourceName || 'Unknown';
+                    const prev = pickedMap.get(src) || 0;
+                    pickedMap.set(src, prev + (Number(e.Gallons) || 0));
+                }
+            });
+
+            const summaryRows = [];
+            summaryRows.push([]);
+            summaryRows.push(['Metric', 'Value']);
+            summaryRows.push(['Total Gallons Dropped', totalDropped]);
+            summaryRows.push([]);
+            summaryRows.push(['Gallons Picked Up by Source', 'Gallons']);
+            for (const [src, gallons] of pickedMap.entries()) {
+                summaryRows.push([src, gallons]);
+            }
+
+            // Append summaryRows to the end of the existing worksheet
+            XLSX.utils.sheet_add_aoa(worksheet, summaryRows, { origin: -1 });
+
+            const d = new Date();
+            const y = d.getFullYear();
+            const m = String(d.getMonth()+1).padStart(2,'0');
+            const day = String(d.getDate()).padStart(2,'0');
+            const dateStr = `${m}${day}${y}`;
+            const heliPart = helicopterNumber ? `-${helicopterNumber}` : '';
+            const filename = `Waterdropping_log${heliPart}-${dateStr}.xlsx`;
+            XLSX.writeFile(workbook, filename);
+            setStatus(`Exported ${filename}`,4000);
+        }catch(e){ console.error(e); setStatus('Export failed'); }
+    }
+
+    // Overpass API lookup to find nearby named water features
+    async function fetchSourceNameFromOverpass(lat, lon) {
+        const radius = 300; // meters
+        const query = `
+            [out:json][timeout:10];
+            (
+              node(around:${radius},${lat},${lon})["natural"="water"]["name"];
+              way(around:${radius},${lat},${lon})["natural"="water"]["name"];
+              relation(around:${radius},${lat},${lon})["natural"="water"]["name"];
+              node(around:${radius},${lat},${lon})["waterway"]["name"];
+              way(around:${radius},${lat},${lon})["waterway"]["name"];
+              relation(around:${radius},${lat},${lon})["waterway"]["name"];
+              node(around:${radius},${lat},${lon})["name"]["water"];
+            );
+            out center tags;`;
+
+        const resp = await fetch('https://overpass-api.de/api/interpreter', {
+            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: `data=${encodeURIComponent(query)}`
+        });
+        if (!resp.ok) throw new Error('Overpass request failed');
+        const json = await resp.json();
+        if (!json.elements || json.elements.length === 0) return '';
+        // prefer the closest element with a name
+        const withName = json.elements.filter(e => e.tags && e.tags.name);
+        if (withName.length === 0) return '';
+        // pick first (Overpass returns near-first) and return its name
+        return withName[0].tags.name || '';
+    }
+
+    // Inline modal to ask user for a source name (no browser prompt)
+    function showSourceNamePrompt(defaultText) {
+        return new Promise(resolve => {
+            let modal = document.getElementById('sourceNameModal');
+            if (modal) modal.remove();
+            modal = document.createElement('div');
+            modal.id = 'sourceNameModal';
+            modal.style.position = 'fixed';
+            modal.style.left = '50%';
+            modal.style.top = '50%';
+            modal.style.transform = 'translate(-50%,-50%)';
+            modal.style.zIndex = 22000;
+            modal.style.background = 'white';
+            modal.style.padding = '12px';
+            modal.style.borderRadius = '8px';
+            modal.style.boxShadow = '0 6px 20px rgba(0,0,0,0.25)';
+            modal.style.minWidth = '260px';
+            modal.innerHTML = `
+                <div style="font-weight:600;margin-bottom:8px">Name water source</div>
+                <div style="font-size:13px;margin-bottom:8px">Enter a name for this water source (optional):</div>
+                <input id="sourceNameInput" value="${defaultText || ''}" placeholder="e.g., Dip Site 1" style="width:100%;padding:8px;font-size:14px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px">
+                <div style="display:flex;gap:8px;justify-content:flex-end"><button id="sourceCancelBtn">Cancel</button><button id="sourceOkBtn" style="background:#3498db;color:#fff;border-radius:6px;padding:8px 12px">OK</button></div>
+            `;
+            document.body.appendChild(modal);
+            document.getElementById('sourceCancelBtn').onclick = () => { modal.remove(); resolve(''); };
+            document.getElementById('sourceOkBtn').onclick = () => { const v = document.getElementById('sourceNameInput').value.trim(); modal.remove(); resolve(v); };
+            setTimeout(()=>{ const i=document.getElementById('sourceNameInput'); if(i) i.focus(); },50);
+        });
+    }
+
+    // Export KML for Dip/Drop sites (skips entries without coordinates)
+    function escapeXml(s) {
+        if (!s && s !== 0) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    }
+
+    function downloadKML() {
+        if (!dataLog || dataLog.length === 0) return setStatus('No data to export yet!');
+        showExportPromptForKML();
+    }
+
+    function showExportPromptForKML(){
+        let modal=document.getElementById('exportModalKML');
+        if(!modal){
+            modal=document.createElement('div');
+            modal.id='exportModalKML';
+            modal.style.position='fixed'; modal.style.left='50%'; modal.style.top='50%'; modal.style.transform='translate(-50%,-50%)'; modal.style.zIndex=20000; modal.style.background='white'; modal.style.padding='14px'; modal.style.borderRadius='8px'; modal.style.boxShadow='0 6px 20px rgba(0,0,0,0.25)'; modal.style.minWidth='260px'; modal.style.maxWidth='90%';
+            modal.innerHTML = `
+                <div style="font-weight:600;margin-bottom:8px">Export KML</div>
+                <div style="font-size:13px;margin-bottom:8px">Enter helicopter number to include in filename:</div>
+                <input id="exportHeliInputKML" placeholder="Helicopter #" style="width:100%;padding:8px;font-size:14px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px">
+                <div style="display:flex;gap:8px;justify-content:flex-end"><button id="exportCancelBtnKML">Cancel</button><button id="exportConfirmBtnKML" style="background:#34495e;color:#fff;border-radius:6px;padding:8px 12px">Export</button></div>
+            `;
+            document.body.appendChild(modal);
+            document.getElementById('exportCancelBtnKML').onclick = ()=>{ modal.remove(); };
+            document.getElementById('exportConfirmBtnKML').onclick = ()=>{ const heli=document.getElementById('exportHeliInputKML').value.trim(); performKMLExport(heli); modal.remove(); };
+            setTimeout(()=>{ const i=document.getElementById('exportHeliInputKML'); if(i) i.focus(); },50);
+        }
+    }
+
+    function performKMLExport(helicopterNumber){
+        try{
+            let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n  <Document>\n    <name>Waterdropping Log</name>\n`;
+            dataLog.forEach(entry => {
+                if (!entry.Latitude || !entry.Longitude) return; // skip entries without coords
+                const name = escapeXml(entry.Event || 'Event');
+                const time = escapeXml(entry.Timestamp || '');
+                const source = escapeXml(entry.SourceName || '');
+                const gallons = escapeXml(entry.Gallons || '');
+                kml += `    <Placemark>\n      <name>${name}</name>\n      <description>Time: ${time} | Source: ${source}${gallons ? ' | Gallons: ' + gallons : ''}</description>\n      <Point><coordinates>${entry.Longitude},${entry.Latitude},0</coordinates></Point>\n    </Placemark>\n`;
+            });
+            kml += '  </Document>\n</kml>';
+
+            const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const d = new Date();
+            const dateStr = `${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}${d.getFullYear()}`;
+            const heliPart = helicopterNumber ? `-${helicopterNumber}` : '';
+            a.download = `Waterdropping_log${heliPart}-${dateStr}.kml`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            setStatus('KML exported', 3000);
+        }catch(e){ console.error(e); setStatus('KML export failed'); }
+    }
+
+    // Service worker registration for offline caching (if available)
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('./sw.js').then(()=>{
+            console.log('Service worker registered');
+        }).catch(()=>{ console.warn('Service worker registration failed'); });
+    }
+</script>
+</body>
+</html>
